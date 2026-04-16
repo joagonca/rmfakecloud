@@ -11,6 +11,7 @@ import (
 	"path"
 	"path/filepath"
 	"strconv"
+	"sort"
 	"strings"
 	"time"
 
@@ -122,23 +123,47 @@ func (fs *FileSystemStorage) Export(uid, docid string) (r io.ReadCloser, err err
 
 			// Extract .rm files directly from blob storage without parsing
 			// First, get content.json to know page order
+			// Support both the legacy flat `pages: ["uuid", ...]` (rmapi archive.Content)
+			// and the newer FW 3.x `cPages.pages[].id` + `idx.value` structure.
 			var contentData archive.Content
+			var newPages []struct {
+				ID  string `json:"id"`
+				Idx struct {
+					Value string `json:"value"`
+				} `json:"idx"`
+			}
 			for _, f := range doc.Files {
 				if filepath.Ext(f.EntryName) == storage.ContentFileExt {
 					blob, err := ls.GetReader(f.Hash)
 					if err == nil {
 						contentBytes, _ := io.ReadAll(blob)
 						blob.Close()
-						err = json.Unmarshal(contentBytes, &contentData)
-						if err != nil {
-							log.Warnf("Failed to unmarshal content.json: %v", err)
+						// Legacy parse (may fail on newer formats, that's fine)
+						if err := json.Unmarshal(contentBytes, &contentData); err != nil {
+							log.Debugf("Legacy content.json parse failed (expected on FW 3.x): %v", err)
+						}
+						// New cPages parse
+						var cp struct {
+							CPages struct {
+								Pages []struct {
+									ID  string `json:"id"`
+									Idx struct {
+										Value string `json:"value"`
+									} `json:"idx"`
+								} `json:"pages"`
+							} `json:"cPages"`
+						}
+						if err := json.Unmarshal(contentBytes, &cp); err == nil {
+							newPages = cp.CPages.Pages
+							log.Debugf("cPages parse found %d pages", len(newPages))
 						}
 					}
 					break
 				}
 			}
 
-			log.Debugf("Content has %d pages", len(contentData.Pages))
+			log.Debugf("Legacy content has %d pages, cPages has %d pages",
+				len(contentData.Pages), len(newPages))
 
 			// Build map of page names to hashes
 			pageMap := make(map[string]string)
@@ -154,8 +179,33 @@ func (fs *FileSystemStorage) Export(uid, docid string) (r io.ReadCloser, err err
 
 			// Extract all pages in order
 			var pageHashes []string
-			if len(contentData.Pages) > 0 {
-				// Use pages from content.json in the correct order
+			if len(newPages) > 0 {
+				// New FW 3.x format: sort cPages.pages by idx.value (alphabetic)
+				// then resolve each id -> hash via pageMap.
+				sorted := make([]struct {
+					ID  string
+					Idx string
+				}, 0, len(newPages))
+				for _, p := range newPages {
+					sorted = append(sorted, struct {
+						ID  string
+						Idx string
+					}{ID: p.ID, Idx: p.Idx.Value})
+				}
+				sort.Slice(sorted, func(i, j int) bool {
+					return sorted[i].Idx < sorted[j].Idx
+				})
+				for _, p := range sorted {
+					if hash, ok := pageMap[p.ID]; ok {
+						pageHashes = append(pageHashes, hash)
+						log.Debugf("cPages ordered: %s (idx=%s) -> %s", p.ID, p.Idx, hash)
+					} else {
+						log.Warnf("cPages page %s not found in pageMap", p.ID)
+					}
+				}
+				log.Infof("Using cPages order for %d pages", len(pageHashes))
+			} else if len(contentData.Pages) > 0 {
+				// Legacy format: use flat pages array
 				for _, pageName := range contentData.Pages {
 					if hash, ok := pageMap[pageName]; ok {
 						pageHashes = append(pageHashes, hash)
@@ -165,8 +215,7 @@ func (fs *FileSystemStorage) Export(uid, docid string) (r io.ReadCloser, err err
 					}
 				}
 			} else {
-				// No pages in content.json, use order from doc.Files (index file order)
-				// doc.Files is sorted alphabetically which reverses page order, so we reverse it back
+				// Last-resort fallback
 				log.Warn("content.json has no pages array, using .rm files in reversed index order")
 				var tempHashes []string
 				for _, f := range doc.Files {
@@ -174,7 +223,6 @@ func (fs *FileSystemStorage) Export(uid, docid string) (r io.ReadCloser, err err
 						tempHashes = append(tempHashes, f.Hash)
 					}
 				}
-				// Reverse the order to get correct page sequence
 				for i := len(tempHashes) - 1; i >= 0; i-- {
 					pageHashes = append(pageHashes, tempHashes[i])
 					log.Infof("Using .rm file in reversed order: page %d", len(tempHashes)-i)
