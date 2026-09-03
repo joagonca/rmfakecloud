@@ -88,6 +88,24 @@ type Layer struct {
 	Name string `json:"name"`
 }
 
+// LWW is a last-write-wins CRDT value as written by firmware 3.x.
+type LWW struct {
+	Value string `json:"value"`
+}
+
+// cPage is one entry of the "cPages.pages" array written by firmware 3.x.
+type cPage struct {
+	ID       string `json:"id"`
+	Template LWW    `json:"template"`
+}
+
+// CPages is the page list container written by firmware 3.x, which
+// replaces the flat "pages" field.
+type CPages struct {
+	Pages      []cPage `json:"pages"`
+	LastOpened LWW     `json:"lastOpened"`
+}
+
 // Content represents the structure of a .content json file.
 type Content struct {
 	DummyDocument bool          `json:"dummyDocument"`
@@ -103,12 +121,27 @@ type Content struct {
 	Orientation string `json:"orientation"`
 	PageCount   int    `json:"pageCount"`
 	// Pages is a list of page IDs
-	Pages          []string `json:"pages"`
-	Tags           []string `json:"pageTags"`
-	RedirectionMap []int    `json:"redirectionPageMap"`
-	TextScale      int      `json:"textScale"`
+	Pages []string `json:"pages"`
+	// CPages is the newer page list written by firmware 3.x
+	CPages         CPages    `json:"cPages"`
+	Tags           []string  `json:"pageTags"`
+	RedirectionMap []int     `json:"redirectionPageMap"`
+	TextScale      int       `json:"textScale"`
 
 	Transform Transform `json:"transform"`
+}
+
+// PageIDs returns the document page ids in order, preferring the newer
+// cPages list and falling back to the legacy flat pages list.
+func (c *Content) PageIDs() []string {
+	if len(c.Pages) == 0 && len(c.CPages.Pages) > 0 {
+		ids := make([]string, 0, len(c.CPages.Pages))
+		for _, p := range c.CPages.Pages {
+			ids = append(ids, p.ID)
+		}
+		return ids
+	}
+	return c.Pages
 }
 
 // ExtraMetadata is a struct contained into a Content struct.

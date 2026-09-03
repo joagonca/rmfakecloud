@@ -187,7 +187,7 @@ func (fs *FileSystemStorage) Export(uid, docid string) (r io.ReadCloser, err err
 				}
 			}
 
-			log.Debugf("Content has %d pages", len(contentData.Pages))
+			log.Debugf("Content has %d pages", len(contentData.PageIDs()))
 
 			// Build map of page names to hashes
 			pageMap := make(map[string]string)
@@ -201,16 +201,18 @@ func (fs *FileSystemStorage) Export(uid, docid string) (r io.ReadCloser, err err
 
 			log.Debugf("Built page map with %d entries", len(pageMap))
 
-			// Extract all pages in order
-			var pageHashes []string
-			if len(contentData.Pages) > 0 {
+			// Extract all pages with their document position
+			type inkEntry struct {
+				pos  int
+				hash string
+			}
+			var inkEntries []inkEntry
+			if pageIDs := contentData.PageIDs(); len(pageIDs) > 0 {
 				// Use pages from content.json in the correct order
-				for _, pageName := range contentData.Pages {
+				for pos, pageName := range pageIDs {
 					if hash, ok := pageMap[pageName]; ok {
-						pageHashes = append(pageHashes, hash)
-						log.Debugf("Found page %s -> %s", pageName, hash)
-					} else {
-						log.Warnf("Page %s not found in pageMap", pageName)
+						inkEntries = append(inkEntries, inkEntry{pos + 1, hash})
+						log.Debugf("Found page %s -> %s (position %d)", pageName, hash, pos+1)
 					}
 				}
 			} else {
@@ -225,24 +227,24 @@ func (fs *FileSystemStorage) Export(uid, docid string) (r io.ReadCloser, err err
 				}
 				// Reverse the order to get correct page sequence
 				for i := len(tempHashes) - 1; i >= 0; i-- {
-					pageHashes = append(pageHashes, tempHashes[i])
+					inkEntries = append(inkEntries, inkEntry{len(tempHashes) - i, tempHashes[i]})
 					log.Infof("Using .rm file in reversed order: page %d", len(tempHashes)-i)
 				}
 			}
 
-			if len(pageHashes) == 0 {
+			if len(inkEntries) == 0 {
 				log.Error("No pages found in v6 document")
 				log.Debugf("Doc files: %+v", doc.Files)
 				writer.CloseWithError(fmt.Errorf("no pages found"))
 				return
 			}
 
-			log.Infof("Exporting %d v6 pages", len(pageHashes))
+			log.Infof("Exporting %d v6 pages", len(inkEntries))
 
-			// Read all pages into memory
+			// Read all pages into memory, in document order
 			var pages [][]byte
-			for i, pageHash := range pageHashes {
-				rmReader, err := ls.GetReader(pageHash)
+			for i, e := range inkEntries {
+				rmReader, err := ls.GetReader(e.hash)
 				if err != nil {
 					log.Errorf("Failed to get v6 page %d data: %v", i, err)
 					writer.CloseWithError(err)
@@ -258,6 +260,47 @@ func (fs *FileSystemStorage) Export(uid, docid string) (r io.ReadCloser, err err
 				}
 
 				pages = append(pages, rmData)
+			}
+
+			// Look for a pdf payload so the ink can be merged on top of
+			// the original document instead of a blank template
+			var payloadBytes []byte
+			for _, f := range doc.Files {
+				if filepath.Ext(f.EntryName) == storage.PdfFileExt {
+					blob, err := ls.GetReader(f.Hash)
+					if err != nil {
+						log.Warnf("Failed to read pdf payload: %v", err)
+						break
+					}
+					payloadBytes, err = io.ReadAll(blob)
+					blob.Close()
+					if err != nil {
+						log.Warnf("Failed to read pdf payload: %v", err)
+						payloadBytes = nil
+					}
+					break
+				}
+			}
+
+			if payloadBytes != nil {
+				// Render the v6 ink to an in-memory pdf, then overlay
+				// each ink page on its original document position
+				var ink bytes.Buffer
+				if err := exporter.ExportV6MultiPageToPdfNative(pages, &ink); err != nil {
+					log.Errorf("Failed to export v6 multipage with rmc-go: %v", err)
+					writer.CloseWithError(err)
+					return
+				}
+				inkToPage := make(map[int]int, len(inkEntries))
+				for i, e := range inkEntries {
+					inkToPage[i+1] = e.pos
+				}
+				if err := exporter.MergeV6AnnotationsWithPDF(payloadBytes, ink.Bytes(), inkToPage, writer); err != nil {
+					log.Errorf("Failed to merge v6 annotations with pdf payload: %v", err)
+					writer.CloseWithError(err)
+					return
+				}
+				return
 			}
 
 			// Use rmc-go library for multipage export (in-process, Cairo renderer)
